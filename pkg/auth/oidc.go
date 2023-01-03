@@ -17,6 +17,8 @@ package auth
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2/clientcredentials"
@@ -25,6 +27,14 @@ import (
 )
 
 type OidcClientConfig struct {
+	// OidcClientEndpoint specifies the endpoint for the OIDC client to use to get a token
+	// in OIDC authentication if AuthenticationMethod == "oidc". By default, this value
+	// is "". The endpoint will use the password grant type and if successful will return
+	// an access token.
+	OidcClientEndpoint string `ini:"oidc_client_endpoint" json:"oidc_client_endpoint"`
+	OidcUsername       string `ini:"oidc_username" json:"oidc_username"`
+	OidcPassword       string `ini:"oidc_password" json:"oidc_password"`
+
 	// OidcClientID specifies the client ID to use to get a token in OIDC
 	// authentication if AuthenticationMethod == "oidc". By default, this value
 	// is "".
@@ -36,9 +46,6 @@ type OidcClientConfig struct {
 	// OidcAudience specifies the audience of the token in OIDC authentication
 	// if AuthenticationMethod == "oidc". By default, this value is "".
 	OidcAudience string `ini:"oidc_audience" json:"oidc_audience"`
-	// OidcScope specifies the scope of the token in OIDC authentication
-	// if AuthenticationMethod == "oidc". By default, this value is "".
-	OidcScope string `ini:"oidc_scope" json:"oidc_scope"`
 	// OidcTokenEndpointURL specifies the URL which implements OIDC Token Endpoint.
 	// It will be used to get an OIDC token if AuthenticationMethod == "oidc".
 	// By default, this value is "".
@@ -55,7 +62,6 @@ func getDefaultOidcClientConf() OidcClientConfig {
 		OidcClientID:                 "",
 		OidcClientSecret:             "",
 		OidcAudience:                 "",
-		OidcScope:                    "",
 		OidcTokenEndpointURL:         "",
 		OidcAdditionalEndpointParams: make(map[string]string),
 	}
@@ -94,7 +100,11 @@ func getDefaultOidcServerConf() OidcServerConfig {
 type OidcAuthProvider struct {
 	BaseConfig
 
-	tokenGenerator *clientcredentials.Config
+	tokenGenerator OidcTokenGenerator
+}
+
+type OidcTokenGenerator interface {
+	GenerateToken(ctx context.Context) (string, error)
 }
 
 func NewOidcAuthSetter(baseCfg BaseConfig, cfg OidcClientConfig) *OidcAuthProvider {
@@ -103,16 +113,21 @@ func NewOidcAuthSetter(baseCfg BaseConfig, cfg OidcClientConfig) *OidcAuthProvid
 		eps[k] = []string{v}
 	}
 
-	if cfg.OidcAudience != "" {
-		eps["audience"] = []string{cfg.OidcAudience}
-	}
+	var tokenGenerator OidcTokenGenerator
+	if cfg.OidcClientEndpoint != "" {
+		// if oidc_client_endpoint is set, use that endpoint to get a token
+		tokenGenerator = NewOidcPasswordTokenGenerator(cfg.OidcClientEndpoint, cfg.OidcUsername, cfg.OidcPassword)
+	} else {
+		// otherwise, use client_credentials grant type
+		tokenGeneratorCfg := &clientcredentials.Config{
+			ClientID:       cfg.OidcClientID,
+			ClientSecret:   cfg.OidcClientSecret,
+			Scopes:         []string{cfg.OidcAudience},
+			TokenURL:       cfg.OidcTokenEndpointURL,
+			EndpointParams: eps,
+		}
 
-	tokenGenerator := &clientcredentials.Config{
-		ClientID:       cfg.OidcClientID,
-		ClientSecret:   cfg.OidcClientSecret,
-		Scopes:         []string{cfg.OidcScope},
-		TokenURL:       cfg.OidcTokenEndpointURL,
-		EndpointParams: eps,
+		tokenGenerator = NewOidcClientCrendentialsTokenGenerator(tokenGeneratorCfg)
 	}
 
 	return &OidcAuthProvider{
@@ -121,12 +136,68 @@ func NewOidcAuthSetter(baseCfg BaseConfig, cfg OidcClientConfig) *OidcAuthProvid
 	}
 }
 
-func (auth *OidcAuthProvider) generateAccessToken() (accessToken string, err error) {
-	tokenObj, err := auth.tokenGenerator.Token(context.Background())
-	if err != nil {
-		return "", fmt.Errorf("couldn't generate OIDC token for login: %v", err)
+type OidcClientCrendentialsTokenGenerator struct {
+	cfg *clientcredentials.Config
+}
+
+func NewOidcClientCrendentialsTokenGenerator(cfg *clientcredentials.Config) *OidcClientCrendentialsTokenGenerator {
+	return &OidcClientCrendentialsTokenGenerator{
+		cfg: cfg,
 	}
-	return tokenObj.AccessToken, nil
+}
+
+func (t *OidcClientCrendentialsTokenGenerator) GenerateToken(ctx context.Context) (string, error) {
+	token, err := t.cfg.Token(ctx)
+	if err != nil {
+		return "", err
+	}
+	return token.AccessToken, nil
+}
+
+type OidcPasswordTokenGenerator struct {
+	clientEndpoint string
+	username       string
+	password       string
+}
+
+func NewOidcPasswordTokenGenerator(clientEndpoint, username, password string) *OidcPasswordTokenGenerator {
+	return &OidcPasswordTokenGenerator{
+		clientEndpoint: clientEndpoint,
+		username:       username,
+		password:       password,
+	}
+}
+
+func (t *OidcPasswordTokenGenerator) GenerateToken(ctx context.Context) (string, error) {
+	client := http.DefaultClient
+
+	req, err := http.NewRequest("POST", t.clientEndpoint, nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.SetBasicAuth(t.username, t.password)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	tokenBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(tokenBytes), nil
+}
+
+func (auth *OidcAuthProvider) generateAccessToken() (accessToken string, err error) {
+	return auth.tokenGenerator.GenerateToken(context.Background())
 }
 
 func (auth *OidcAuthProvider) SetLogin(loginMsg *msg.Login) (err error) {
